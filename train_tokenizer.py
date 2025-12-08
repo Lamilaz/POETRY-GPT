@@ -30,7 +30,7 @@ trainer = BpeTrainer(
 
 pre_tokenizer = Sequence([WhiteSpaceWithSplit, Digits(individual_digits=True)])
 normalizer = normalizers.Sequence([
-    normalizers.NFC(), 
+    normalizers.NFD(), 
     normalizers.StripAccents(), 
     normalizers.Lowercase()
 ])
