@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+
 # IMPORTS
+import math
 import tokenizers
 import wandb
 import torch
@@ -32,8 +34,14 @@ lr = 3e-3
 max_iters = 5000
 eval_every = 100
 eval_iters = 50
-save_every = 200
+save_every = 500
 checkpoint = "lamilaz.pt"
+
+# Nouveaux paramètres pour le LR Scheduler
+learning_rate = 6e-4   # Max learning rate (beaucoup plus safe que 3e-3)
+min_lr = 6e-5          # Minimum (souvent 10% du max)
+warmup_iters = 200     # Nombre de steps pour monter en puissance
+max_iters = 10000       # Durée totale de l'entraînement
 
 # LOAD TOKENIZER
 tokenizer = Tokenizer.from_file("tokenizer.json")
@@ -65,12 +73,25 @@ def decode(ids):
         return tokenizer.decode(ids)
     return ""
 
+def get_lr(it):
+    # 1. Phase de Warmup : augmentation linéaire
+    if it < warmup_iters:
+        return learning_rate * (it + 1) / (warmup_iters + 1)
+    
+    # 2. Après la fin de l'entrainement : garde le minimum
+    if it > max_iters:
+        return min_lr
+    
+    # 3. Phase de Decay : courbe Cosinus
+    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # varie entre 0 et 1
+    return min_lr + coeff * (learning_rate - min_lr)
 
 # --- 2. DATASET AVEC STREAMING (ZÉRO RAM) ---
 class StreamingTextDataset(Dataset):
     """Dataset qui charge les textes à la demande depuis le stream"""
 
-    def __init__(self, stream_dataset, tokenizer, block_size, max_samples=100000):
+    def __init__(self, stream_dataset, tokenizer, block_size, max_samples=1000000):
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.max_samples = max_samples
@@ -130,7 +151,7 @@ class StreamingTextDataset(Dataset):
 class MinimalStreamDataset(Dataset):
     """Version minimaliste: génère à la volée depuis le stream"""
 
-    def __init__(self, stream_dataset, tokenizer, block_size, buffer_size=10000):
+    def __init__(self, stream_dataset, tokenizer, block_size, buffer_size=100000):
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.buffer = []
@@ -181,7 +202,7 @@ val_texts_iter = dataset_stream.filter(lambda x, idx: idx % 10 == 0, with_indice
 
 print(f"Création des datasets en streaming...")
 train_dataset = StreamingTextDataset(train_texts_iter, tokenizer, block_size, max_samples=100000)
-val_dataset = StreamingTextDataset(val_texts_iter, tokenizer, block_size, max_samples=10000)
+val_dataset = StreamingTextDataset(val_texts_iter, tokenizer, block_size, max_samples=100000)
 
 # DataLoaders (RÉDUIRE num_workers si RAM limitée)
 train_loader = DataLoader(
@@ -259,7 +280,7 @@ def model_loss(model, x, targets):
     B, T, V = logits.shape
     logits = logits.view(B * T, V)
     targets = targets.view(B * T)
-    loss = F.cross_entropy(logits, targets)
+    loss = F.cross_entropy(logits, targets, ignore_index=0)
     return loss
 
 
@@ -292,9 +313,14 @@ def evaluate(model, dataloader, max_batches=None):
 
 # --- 4. EXECUTION ---
 model = TransformerDecoder()
-model.load_state_dict(torch.load("lamilaz.pt", weights_only=True))
-if torch.cuda.device_count() > 1:
-    model = nn.DataParallel(model)
+
+try : 
+    model.load_state_dict(torch.load("lamilaz_1000.pt", weights_only=True))
+except:
+    print("no model existing yet, starting from scratch")
+# if torch.cuda.device_count() > 1:
+#     model = nn.DataParallel(model)
+device = torch.device("cuda:0")
 model = model.to(device)
 
 print("Parameters:", sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
@@ -302,54 +328,65 @@ optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
 # BOUCLE D'ENTRAÎNEMENT
 step = 0
-for epoch in range(100):  # Nombre d'epochs arbitraire
-    for x, y in train_loader:
-        step += 1
+for x, y in train_loader:
+    step += 1
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+    # Validation
+    if step % eval_every == 0:
+        train_loss = evaluate(model, train_loader, max_batches=eval_iters)
+        val_loss = evaluate(model, val_loader, max_batches=eval_iters)
+        prompts = torch.tensor([encode(p) for p in ["Hello", "Love", "Help"]]).to(device)
+        outputs = generate(model, prompts, 100)
+        outputs = [[decode(output.tolist())] for output in outputs]
+        print(f"step {step}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
 
-        # Validation
-        if step % eval_every == 0:
-            train_loss = evaluate(model, train_loader, max_batches=eval_iters)
-            val_loss = evaluate(model, val_loader, max_batches=eval_iters)
-            prompts = torch.tensor([encode(p) for p in ["Hello", "Love", "Help"]]).to(device)
-            outputs = generate(model, prompts, 100)
-            outputs = [[decode(output.tolist())] for output in outputs]
-            print(f"step {step}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+        wandb.log({
+            "lr" : lr,
+            "step": step,
+            "train loss": train_loss,
+            "validation loss": val_loss,
+            "samples": wandb.Table(columns=["samples"], data=outputs)
+        })
 
-            wandb.log({
-                "step": step,
-                "train loss": train_loss,
-                "validation loss": val_loss,
-                "samples": wandb.Table(columns=["samples"], data=outputs)
-            })
+        # Test de génération
+        try:
+            start_ids = encode("Hello")
+            if len(start_ids) > 0:
+                context = torch.tensor([start_ids], dtype=torch.long, device=device)
+                output = generate(model, context, max_new_tokens=50)
+                print(f"Generated: {decode(output[0].tolist())}")
+        except Exception as e:
+            print(f"Erreur generation: {e}")
 
-            # Test de génération
-            try:
-                start_ids = encode("Hello")
-                if len(start_ids) > 0:
-                    context = torch.tensor([start_ids], dtype=torch.long, device=device)
-                    output = generate(model, context, max_new_tokens=50)
-                    print(f"Generated: {decode(output[0].tolist())}")
-            except Exception as e:
-                print(f"Erreur generation: {e}")
+    # Sauvegarde
+    if step > 0 and step % save_every == 0:
+        torch.save(model.state_dict(), f"{checkpoint[:-3]}_{step}.pt")
 
-        # Sauvegarde
-        if step > 0 and step % save_every == 0:
-            torch.save(model.state_dict(), checkpoint)
-
-        # Train step
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        loss = model_loss(model, x, y)
-        loss.backward()
-        optimizer.step()
-
-        if step >= max_iters:
-            break
+    # Train step
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    loss = model_loss(model, x, y)
+    loss.backward()
+    optimizer.step()
 
     if step >= max_iters:
         break
 
 print("Training completed!")
+torch.save(model.state_dict(), f"{checkpoint}")
 wandb.finish()
 
+import re
+def gen(prompt, model=model, token=100):
+    start_ids = tokenizer.encode(prompt).ids
+    if len(start_ids) > 0:
+        context = torch.tensor([start_ids], dtype=torch.long, device=device)
+        output = generate(model, context, max_new_tokens=50)
+        text = str(decode(output[0].tolist()))
+        text = re.sub(r'§', ' ', re.sub(r' ', '', re.sub(r'  ', '§', text)))
+        print(f"Generated: {text}")
+
+gen("Nirvana")
 
