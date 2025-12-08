@@ -41,19 +41,26 @@
     }
   ],
   "normalizer": {
-    "type": "Sequence",
-    "normalizers": [
-      {
-        "type": "NFD"
-      },
-      {
-        "type": "StripAccents"
-      },
-      {
-        "type": "Lowercase"
-      }
-    ]
-  },
+      "type": "Sequence",
+      "normalizers": [
+        {
+          "type": "NFD"
+        },
+        {
+          "type": "Replace",
+          "pattern": {
+            "Regex": "\"|''"
+          },
+          "content": ""
+        },
+        {
+          "type": "StripAccents"
+        },
+        {
+          "type": "Lowercase"
+        }
+      ]
+    },
   "pre_tokenizer": {
     "type": "Sequence",
     "pretokenizers": [
