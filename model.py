@@ -1,392 +1,350 @@
 # -*- coding: utf-8 -*-
-
-# IMPORTS
 import math
-import tokenizers
-import wandb
+import os
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import Whitespace, Sequence, Split, Digits
-from tokenizers import normalizers
 from datasets import load_dataset
-import random
-import numpy as np
+import wandb
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from bert_score import score as bert_score_func
+from sentence_transformers import SentenceTransformer, util
+import logging
 
+# Configuration silencieuse
+logging.getLogger("transformers").setLevel(logging.ERROR)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# --- 1. SETUP GLOBAL ---
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
+# --- CONFIGURATION ---
+config = {
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "dropout": 0.2,
+    "d_model": 512,
+    "n_heads": 8,
+    "n_layers": 6,
+    "block_size": 256,
+    "batch_size": 32,
+    "max_lr": 6e-4,
+    "min_lr": 6e-5,
+    "warmup_iters": 300,
+    "max_iters": 100000,
+    "eval_every": 200,
+    "eval_iters": 50,
+    "save_every": 500,
+    "checkpoint_name": "lamilaz_new.pt",
+    "wandb_id": "uo2jduuz",
+    "wandb_project": "nano-gpt"
+}
 
-# HYPERPARAMETERS
-dropout = 0.2
-d_model = 512
-vocab_size = 30000
-n_heads = 8
-n_main_layers = 6
-block_size = 256
-batch_size = 32
-lr = 3e-3
-max_iters = 5000
-eval_every = 100
-eval_iters = 50
-save_every = 500
-checkpoint = "lamilaz.pt"
+device = config["device"]
 
-# Nouveaux paramètres pour le LR Scheduler
-learning_rate = 6e-4   # Max learning rate (beaucoup plus safe que 3e-3)
-min_lr = 6e-5          # Minimum (souvent 10% du max)
-warmup_iters = 200     # Nombre de steps pour monter en puissance
-max_iters = 10000       # Durée totale de l'entraînement
-
-# LOAD TOKENIZER
+# --- TOKENIZER & METRICS ---
 tokenizer = Tokenizer.from_file("tokenizer.json")
 vocab_size = tokenizer.get_vocab_size()
 
-wandb.init(
-    project="nano-gpt",
-    config={
-        "model": "lamilaz",
-        "batch_size": batch_size,
-        "block_size": block_size,
-        "d_model": d_model,
-        "main_layers": n_main_layers,
-        "n_heads": n_heads,
-        "dropout": dropout,
-        "learning_rate": lr,
-        "vocab_size": vocab_size
-    }
-)
+print("Loading semantic model...")
+semantic_model = SentenceTransformer('all-MiniLM-L6-v2').to(device)
 
-# FONCTIONS GLOBALES
+# --- UTILS ---
 def encode(s):
-    if hasattr(tokenizer, 'encode'):
-        return tokenizer.encode(s).ids
-    return []
+    return tokenizer.encode(s).ids if hasattr(tokenizer, 'encode') else []
 
 def decode(ids):
-    if hasattr(tokenizer, 'decode'):
-        return tokenizer.decode(ids)
-    return ""
+    return tokenizer.decode(ids) if hasattr(tokenizer, 'decode') else ""
 
 def get_lr(it):
-    # 1. Phase de Warmup : augmentation linéaire
-    if it < warmup_iters:
-        return learning_rate * (it + 1) / (warmup_iters + 1)
-    
-    # 2. Après la fin de l'entrainement : garde le minimum
-    if it > max_iters:
-        return min_lr
-    
-    # 3. Phase de Decay : courbe Cosinus
-    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # varie entre 0 et 1
-    return min_lr + coeff * (learning_rate - min_lr)
+    if it < config["warmup_iters"]:
+        return config["max_lr"] * (it + 1) / (config["warmup_iters"] + 1)
+    if it > config["max_iters"]:
+        return config["min_lr"]
+    decay_ratio = (it - config["warmup_iters"]) / (config["max_iters"] - config["warmup_iters"])
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return config["min_lr"] + coeff * (config["max_lr"] - config["min_lr"])
 
-# --- 2. DATASET AVEC STREAMING (ZÉRO RAM) ---
+def upload_to_drive(filename, drive_folder_id=None):
+    if not os.path.exists('token.json'): return
+    try:
+        creds = Credentials.from_authorized_user_file('token.json', ['https://www.googleapis.com/auth/drive.file'])
+        service = build('drive', 'v3', credentials=creds)
+        file_metadata = {'name': os.path.basename(filename)}
+        if drive_folder_id: file_metadata['parents'] = [drive_folder_id]
+        media = MediaFileUpload(filename, resumable=True)
+        service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        print(f"Uploaded: {filename}")
+    except Exception as e:
+        print(f"Drive Upload Error: {e}")
+
 class StreamingTextDataset(Dataset):
-    """Dataset qui charge les textes à la demande depuis le stream"""
-
-    def __init__(self, stream_dataset, tokenizer, block_size, max_samples=1000000):
-        self.tokenizer = tokenizer
+    def __init__(self, stream_dataset, block_size, max_samples=100000):
         self.block_size = block_size
         self.max_samples = max_samples
+        # On transforme le stream en itérateur persistant pour reprendre où on s'est arrêté
+        self.iterator = iter(stream_dataset) 
+        self.samples = []
+        
+        # Premier chargement automatique
+        self.renew_data()
 
-        # On ne charge QUE les indices, pas les textes
-        print(f"Préparation du cache d'indices (max {max_samples} samples)...")
-        self.samples = []  # Liste de (text, start_idx) pour chaque sample
+    def renew_data(self):
+        """Vide la mémoire et charge le paquet suivant de données"""
+        print(f"🔄 Chargement de {self.max_samples} nouvelles données...")
+        self.samples = [] # On vide la RAM
+        count = 0
+        
+        try:
+            while count < self.max_samples:
+                # On récupère le prochain texte du stream (internet/cache)
+                item = next(self.iterator)
+                text = item["text"]
+                
+                if not text or len(text.strip()) == 0: 
+                    continue
+                
+                tokens = encode(text)
+                # On découpe le texte en morceaux de la taille du contexte
+                num_chunks = max(1, len(tokens) - self.block_size)
+                
+                for start_idx in range(num_chunks):
+                    if count >= self.max_samples: break
+                    self.samples.append((text, start_idx))
+                    count += 1
+                    
+        except StopIteration:
+            print("⚠️ Fin du dataset atteinte ! On repart du début au prochain tour.")
+            # Optionnel : relancer l'iterator si tu veux tourner en boucle à l'infini sur un petit dataset
+            # self.iterator = iter(self.original_stream) 
 
-        sample_count = 0
-        text_count = 0
-
-        for item in stream_dataset:
-            if sample_count >= max_samples:
-                break
-
-            text = item["text"]
-            if not text or len(text.strip()) == 0:
-                continue
-
-            # Encoder UNE SEULE FOIS pour compter
-            tokens = encode(text)
-            num_samples = max(1, len(tokens) - block_size)
-
-            # Stocker le texte ET les positions possibles
-            for start_idx in range(num_samples):
-                if sample_count >= max_samples:
-                    break
-                self.samples.append((text, start_idx))
-                sample_count += 1
-
-            text_count += 1
-
-        print(f"Dataset prêt: {len(self.samples)} samples depuis {text_count} textes")
+        print(f"✅ Dataset rechargé : {len(self.samples)} nouveaux échantillons prêts.")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
+        # Sécurité si l'index est hors limite (peut arriver lors du switch)
+        if idx >= len(self.samples):
+            idx = idx % len(self.samples)
+
         text, start_idx = self.samples[idx]
-
-        # Encoder SEULEMENT au moment de l'utilisation
         tokens = encode(text)
-
-        # Extraire la séquence
-        x = tokens[start_idx:start_idx + self.block_size]
-        y = tokens[start_idx + 1:start_idx + self.block_size + 1]
-
-        # Padding si nécessaire
-        if len(x) < self.block_size:
-            x = x + [0] * (self.block_size - len(x))
-            y = y + [0] * (self.block_size - len(y))
-
+        
+        x = tokens[start_idx : start_idx + self.block_size]
+        y = tokens[start_idx + 1 : start_idx + self.block_size + 1]
+        
+        # Padding robuste
+        if len(x) < self.block_size: x = x + [0] * (self.block_size - len(x))
+        if len(y) < self.block_size: y = y + [0] * (self.block_size - len(y))
+            
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
-
-# --- ALTERNATIVE: DATASET ULTRA-LÉGER (SI TROP DE RAM) ---
-class MinimalStreamDataset(Dataset):
-    """Version minimaliste: génère à la volée depuis le stream"""
-
-    def __init__(self, stream_dataset, tokenizer, block_size, buffer_size=100000):
-        self.tokenizer = tokenizer
-        self.block_size = block_size
-        self.buffer = []
-        self.buffer_size = buffer_size
-
-        # Remplir un buffer initial
-        print(f"Remplissage du buffer ({buffer_size} samples)...")
-        for i, item in enumerate(stream_dataset):
-            if i >= buffer_size:
-                break
-            text = item["text"]
-            if text and len(text.strip()) > 0:
-                self.buffer.append(text)
-
-        print(f"Buffer prêt: {len(self.buffer)} textes")
-
-    def __len__(self):
-        # Estimation approximative
-        return len(self.buffer) * 10  # ~10 samples par texte en moyenne
-
-    def __getitem__(self, idx):
-        # Prendre un texte aléatoire du buffer
-        text = random.choice(self.buffer)
-        tokens = encode(text)
-
-        if len(tokens) <= self.block_size:
-            x = tokens + [0] * (self.block_size - len(tokens))
-            y = x[1:] + [0]
-        else:
-            # Position aléatoire
-            start = random.randint(0, len(tokens) - self.block_size - 1)
-            x = tokens[start:start + self.block_size]
-            y = tokens[start + 1:start + self.block_size + 1]
-
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
-
-
-# --- CHARGEMENT DES DONNÉES EN STREAMING ---
-print("Chargement du dataset en mode streaming...")
-
-# MODE STREAMING : ne charge PAS tout en RAM
-dataset_stream = load_dataset("rojagtap/bookcorpus", split="train", streaming=True)
-
-# Échantillonner pour train/val sans tout charger
-# On prend 1 texte sur 10 pour validation (10%)
-train_texts_iter = dataset_stream.filter(lambda x, idx: idx % 10 != 0, with_indices=True)
-val_texts_iter = dataset_stream.filter(lambda x, idx: idx % 10 == 0, with_indices=True)
-
-print(f"Création des datasets en streaming...")
-train_dataset = StreamingTextDataset(train_texts_iter, tokenizer, block_size, max_samples=100000)
-val_dataset = StreamingTextDataset(val_texts_iter, tokenizer, block_size, max_samples=100000)
-
-# DataLoaders (RÉDUIRE num_workers si RAM limitée)
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=0,  # 0 = pas de multiprocessing (économise RAM)
-    pin_memory=False  # Désactiver si pas de GPU
-)
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=False
-)
-
-print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
-
-
-# --- 3. MODEL ---
-class FeedForward(torch.nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, d_model):
         super().__init__()
-        self.fc1 = torch.nn.Linear(d_model, 4*d_model)
-        self.fc2 = torch.nn.Linear(4*d_model, d_model)
-        self.relu = torch.nn.ReLU()
-        self.drop = torch.nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.ReLU(),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(config["dropout"])
+        )
 
     def forward(self, x):
-        return self.drop(self.fc2(self.relu(self.fc1(x))))
+        return self.net(x)
 
-
-class MainLayer(torch.nn.Module):
-    def __init__(self, d_model, num_heads):
+class MainLayer(nn.Module):
+    def __init__(self, d_model, n_heads):
         super().__init__()
-        self.num_heads = num_heads
-        self.multihead = torch.nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-        self.norm1 = torch.nn.LayerNorm(d_model)
-        self.norm2 = torch.nn.LayerNorm(d_model)
+        self.multihead = nn.MultiheadAttention(d_model, n_heads, batch_first=True, dropout=config["dropout"])
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
         self.feed_forward = FeedForward(d_model)
 
     def compute_attn_mask(self, x):
-        N, L = x.shape[:2]
-        attn_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
-        return attn_mask
+        L = x.shape[1]
+        return torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
 
     def forward(self, x):
         qkv = self.norm1(x)
-        attn_output, _ = self.multihead(qkv, qkv, qkv, attn_mask=self.compute_attn_mask(x), need_weights=False)
-        x = x + attn_output
-        return x + self.feed_forward(self.norm2(x))
-
+        attn_out, _ = self.multihead(qkv, qkv, qkv, attn_mask=self.compute_attn_mask(x), need_weights=False)
+        x = x + attn_out
+        x = x + self.feed_forward(self.norm2(x))
+        return x
 
 class TransformerDecoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
-        self.position_embedding = nn.Embedding(block_size, d_model)
-        self.main_layers = torch.nn.Sequential(*[MainLayer(d_model, n_heads) for i in range(n_main_layers)])
-        self.linear = nn.Linear(d_model, vocab_size)
+        self.token_embedding = nn.Embedding(vocab_size, config["d_model"])
+        self.position_embedding = nn.Embedding(config["block_size"], config["d_model"])
+        self.layers = nn.Sequential(*[MainLayer(config["d_model"], config["n_heads"]) for _ in range(config["n_layers"])])
+        self.ln_f = nn.LayerNorm(config["d_model"])
+        self.head = nn.Linear(config["d_model"], vocab_size)
 
     def forward(self, x):
         B, T = x.shape
-        pos_emb = self.position_embedding(torch.arange(T, device=device))
         tok_emb = self.token_embedding(x)
-        merged_embedding = tok_emb + pos_emb
-        merged_embedding = self.main_layers(merged_embedding)
-        return self.linear(merged_embedding)
-
+        pos_emb = self.position_embedding(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        x = self.layers(x)
+        x = self.ln_f(x)
+        return self.head(x)
 
 def model_loss(model, x, targets):
     logits = model(x)
     B, T, V = logits.shape
-    logits = logits.view(B * T, V)
-    targets = targets.view(B * T)
-    loss = F.cross_entropy(logits, targets, ignore_index=0)
+    loss = F.cross_entropy(logits.view(B * T, V), targets.view(B * T), ignore_index=0)
     return loss
-
 
 def generate(model, x, max_new_tokens):
     for _ in range(max_new_tokens):
-        x_crop = x[:, -block_size:]
-        logits = model(x_crop)
-        logits = logits[:, -1, :]
+        x_crop = x[:, -config["block_size"]:]
+        logits = model(x_crop)[:, -1, :]
         probs = F.softmax(logits, dim=1)
         x_next = torch.multinomial(probs, num_samples=1)
         x = torch.cat([x, x_next], dim=1)
     return x
 
-
 @torch.no_grad()
-def evaluate(model, dataloader, max_batches=None):
+def evaluate_loss(model, dataloader, max_batches):
     model.eval()
     losses = []
-
     for i, (x, y) in enumerate(dataloader):
-        if max_batches and i >= max_batches:
-            break
-        x, y = x.to(device), y.to(device)
-        loss = model_loss(model, x, y)
-        losses.append(loss.item())
-
+        if i >= max_batches: break
+        losses.append(model_loss(model, x.to(device), y.to(device)).item())
     model.train()
     return np.mean(losses) if losses else 0.0
 
+@torch.no_grad()
+def evaluate_semantics(model, dataset, num_samples=4, max_new=50):
+    model.eval()
+    refs, cands = [], []
+    indices = torch.randperm(len(dataset))[:num_samples]
+    
+    for idx in indices:
+        x, _ = dataset[idx]
+        mid = len(x) // 2
+        ctx = x[:mid].unsqueeze(0).to(device)
+        target = x[mid:mid+max_new].tolist()
+        
+        gen = generate(model, ctx, max_new)[0, mid:].tolist()
+        cands.append(decode(gen))
+        refs.append(decode(target))
+        
+    emb1 = semantic_model.encode(cands, convert_to_tensor=True)
+    emb2 = semantic_model.encode(refs, convert_to_tensor=True)
+    cosine = torch.diag(util.cos_sim(emb1, emb2)).mean().item()
+    
+    try:
+        _, _, F1 = bert_score_func(cands, refs, lang="en", verbose=False, device=device)
+        bert_val = F1.mean().item()
+    except:
+        bert_val = 0.0
+        
+    model.train()
+    return bert_val, cosine, cands, refs
 
-# --- 4. EXECUTION ---
-model = TransformerDecoder()
+# --- MAIN ---
+if __name__ == "__main__":
+    # =========================================================================
+    # ÉTAPE 1 : INITIALISATION (À FAIRE UNE SEULE FOIS AU DÉBUT)
+    # =========================================================================
+    
+    # 1. WandB & Config
+    wandb.init(project=config["wandb_project"], resume="allow", config=config, id=config["wandb_id"])
+    
+    # 2. Création du Modèle & Optimiseur (Le "Cerveau")
+    print("Création du modèle...")
+    model = TransformerDecoder().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["max_lr"])
+    print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-try : 
-    model.load_state_dict(torch.load("lamilaz_1000.pt", weights_only=True))
-except:
-    print("no model existing yet, starting from scratch")
-# if torch.cuda.device_count() > 1:
-#     model = nn.DataParallel(model)
-device = torch.device("cuda:0")
-model = model.to(device)
+    # 3. Reprise d'entraînement (Si le fichier existe)
+    step = 0
+    # if os.path.exists(config["checkpoint_name"]):
+    #     print(f"♻️ Reprise depuis {config['checkpoint_name']}...")
+    #     checkpoint = torch.load(config["checkpoint_name"], map_location=device)
+    #     model.load_state_dict(checkpoint)
+        # Idéalement, sauvegarder 'step' dans le checkpoint pour reprendre exactement au bon endroit
+        # step = checkpoint.get('step', 0) 
+    print("Streaming data ...")
+    # On charge le stream UNE SEULE FOIS pour ne pas repartir du début à chaque refresh
+    ds_stream = load_dataset("rojagtap/bookcorpus", split="train", streaming=True)
+    
+    # On instancie nos datasets intelligents
+    # Train: prend les items 3 à 19 sur chaque bloc de 20
+    train_ds = StreamingTextDataset(
+        ds_stream.filter(lambda x, i: (i % 20) >= 3, with_indices=True), 
+        config["block_size"]
+    )
+    # Val: prend les items 0, 1, 2 sur chaque bloc de 20
+    val_ds = StreamingTextDataset(
+        ds_stream.filter(lambda x, i: (i % 20) < 3, with_indices=True), 
+        config["block_size"]
+    )
 
-print("Parameters:", sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # =========================================================================
+    # ÉTAPE 2 : BOUCLE INFINIE D'ENTRAÎNEMENT
+    # =========================================================================
+    model.train()
+    print("🚀 Début de l'entraînement !")
+    batch_num = 0
+    while step < config["max_iters"]:
+        batch_num+=1
+        # A. Création des Loaders pour le chunk actuel
+        # On doit les recréer car la taille du dataset change à chaque renew_data()
+        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0)
 
-# BOUCLE D'ENTRAÎNEMENT
-step = 0
-for x, y in train_loader:
-    step += 1
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-    # Validation
-    if step % eval_every == 0:
-        train_loss = evaluate(model, train_loader, max_batches=eval_iters)
-        val_loss = evaluate(model, val_loader, max_batches=eval_iters)
-        prompts = torch.tensor([encode(p) for p in ["Hello", "Love", "Help"]]).to(device)
-        outputs = generate(model, prompts, 100)
-        outputs = [[decode(output.tolist())] for output in outputs]
-        print(f"step {step}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+        # B. Boucle sur les données actuelles (RAM)
+        for x, y in train_loader:
+            step += 1
+            
+            # --- LEARNING RATE & OPTIMIZER ---
+            lr = get_lr(step)
+            for param_group in optimizer.param_groups: param_group['lr'] = lr
+            
+            # --- EVALUATION ---
+            if step % config["eval_every"] == 0:
+                t_loss = evaluate_loss(model, train_loader, config["eval_iters"])
+                v_loss = evaluate_loss(model, val_loader, config["eval_iters"])
+                # Note: evaluate_semantics peut être lent, à commenter si besoin de vitesse
+                bert, cos, cands, refs = evaluate_semantics(model, val_ds)
+                
+                print(f"Step {step}: Val Loss {v_loss:.4f} | BERT {bert:.4f} | Cos {cos:.4f}")
+                wandb.log({
+                    "step": step, "lr": lr,
+                    "train_loss": t_loss, "val_loss": v_loss,
+                    "bert_score": bert, "cosine_sim": cos,
+                    "semantic_table": wandb.Table(columns=["Gen", "Ref"], data=list(zip(cands, refs))),
+                    "batch_number" : batch_num
+                })
 
-        wandb.log({
-            "lr" : lr,
-            "step": step,
-            "train loss": train_loss,
-            "validation loss": val_loss,
-            "samples": wandb.Table(columns=["samples"], data=outputs)
-        })
+            # --- SAUVEGARDE ---
+            if step % config["save_every"] == 0:
+                print(f"💾 Sauvegarde au step {step}...")
+                fname = config["checkpoint_name"]
+                torch.save(model.state_dict(), fname) # Sauvegarde simple des poids
+                upload_to_drive(fname)
 
-        # Test de génération
-        try:
-            start_ids = encode("Hello")
-            if len(start_ids) > 0:
-                context = torch.tensor([start_ids], dtype=torch.long, device=device)
-                output = generate(model, context, max_new_tokens=50)
-                print(f"Generated: {decode(output[0].tolist())}")
-        except Exception as e:
-            print(f"Erreur generation: {e}")
+            # --- BACKPROPAGATION (APPRENTISSAGE) ---
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad() # Reset des gradients précédents
+            loss = model_loss(model, x, y) # Calcul de l'erreur
+            loss.backward() # Calcul de la correction nécessaire
+            optimizer.step() # Application de la correction
 
-    # Sauvegarde
-    if step > 0 and step % save_every == 0:
-        torch.save(model.state_dict(), f"{checkpoint[:-3]}_{step}.pt")
+            # Stop si on a fini
+            if step >= config["max_iters"]: 
+                break 
 
-    # Train step
-    x, y = x.to(device), y.to(device)
-    optimizer.zero_grad()
-    loss = model_loss(model, x, y)
-    loss.backward()
-    optimizer.step()
-
-    if step >= max_iters:
-        break
-
-print("Training completed!")
-torch.save(model.state_dict(), f"{checkpoint}")
-wandb.finish()
-
-import re
-def gen(prompt, model=model, token=100):
-    start_ids = tokenizer.encode(prompt).ids
-    if len(start_ids) > 0:
-        context = torch.tensor([start_ids], dtype=torch.long, device=device)
-        output = generate(model, context, max_new_tokens=50)
-        text = str(decode(output[0].tolist()))
-        text = re.sub(r'§', ' ', re.sub(r' ', '', re.sub(r'  ', '§', text)))
-        print(f"Generated: {text}")
-
-gen("Nirvana")
-
+        # C. FIN DU CHUNK -> ON RECHARGE DE NOUVELLES DONNÉES
+        if step < config["max_iters"]:
+            print(f"--- Fin du chunk de données. Téléchargement de la suite... ---")
+            train_ds.renew_data()
+            val_ds.renew_data()
+            
+    wandb.finish()
+    print("✅ Entraînement terminé avec succès.")
