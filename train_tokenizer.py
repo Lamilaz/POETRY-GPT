@@ -42,7 +42,7 @@ normalizer = normalizers.Sequence([
     # \ est échappé en \\
     # ^ est mis à la fin pour ne pas être confondu avec la négation
     # * + = pour nettoyer les en-têtes de chapitres
-    Replace(Regex(r"[%$£€@#~{}\[\]|<>^&*+=_`\\]()§;"), ""),
+    Replace(Regex(r"[%$£€@#~{}\[\]|<>^&*+=_`\\()§;]"), ""),
 
     # 3. Supprimer les guillemets bizarres et tirets de dialogue bizarres
     Replace(Regex(r"``"), ""),
@@ -65,5 +65,5 @@ tokenizer.train_from_iterator(get_training_corpus(), trainer=trainer)
 
 tokenizer.decoder = ByteLevelDecoder()
 
-tokenizer.save("/home/lamilaz/lamilaz_tokenizer_latest.json")
+tokenizer.save("/home/LLM/jouanikomachon/tokenizer_no_special_char.json")
 print("Entraînement terminé et tokenizer sauvegardé.")
