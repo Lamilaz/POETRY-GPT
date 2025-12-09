@@ -295,14 +295,18 @@ if __name__ == "__main__":
     
     # On instancie nos datasets intelligents
     # Train: prend les items 3 à 19 sur chaque bloc de 20
+# Train: On baisse max_samples à 20 000 (au lieu de 100 000 par défaut)
     train_ds = StreamingTextDataset(
         ds_stream.filter(lambda x, i: (i % 20) >= 3, with_indices=True), 
-        config["block_size"]
+        config["block_size"],
+        max_samples=20000  # <--- AJOUTE CECI
     )
-    # Val: prend les items 0, 1, 2 sur chaque bloc de 20
+    
+    # Val: On baisse aussi (ex: 5000 suffisent largement pour la validation)
     val_ds = StreamingTextDataset(
         ds_stream.filter(lambda x, i: (i % 20) < 3, with_indices=True), 
-        config["block_size"]
+        config["block_size"],
+        max_samples=5000   # <--- AJOUTE CECI
     )
 
     # =========================================================================
