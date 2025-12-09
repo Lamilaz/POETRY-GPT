@@ -40,7 +40,7 @@ config = {
     "checkpoint_name": "modelv2",
     "wandb_project": "nano-gpt",
     "dataset_name": "rojagtap/bookcorpus", # Dataset cible
-    "use_compile": True # Activer torch.compile (PyTorch 2.0+)
+    "use_compile": False # Activer torch.compile (PyTorch 2.0+)
 }
 
 device = config["device"]
