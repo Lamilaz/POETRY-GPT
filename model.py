@@ -33,7 +33,7 @@ config = {
     "max_lr": 6e-4,
     "min_lr": 6e-5,
     "warmup_iters": 300,
-    "max_iters": 10000000,
+    "max_iters": 50000,
     "eval_every": 200,
     "eval_iters": 50,
     "save_every": 500,
@@ -92,55 +92,40 @@ class StreamingTextDataset(Dataset):
         self.renew_data()
 
     def renew_data(self):
-        """Vide la mémoire et charge le paquet suivant de données"""
         print(f"🔄 Chargement de {self.max_samples} nouvelles données...")
-        self.samples = [] # On vide la RAM
+        self.samples = [] 
         count = 0
         
         try:
             while count < self.max_samples:
-                # On récupère le prochain texte du stream (internet/cache)
-                item = next(self.iterator)
+                try:
+                    item = next(self.iterator)
+                except StopIteration:
+                    print("⚠️ Fin du dataset source ! On repart du début.")
+                    # Recharger le dataset depuis le début si nécessaire
+                    # self.iterator = iter(load_dataset(...)) 
+                    break
+
                 text = item["text"]
-                
-                if not text or len(text.strip()) == 0: 
-                    continue
+                if not text or len(text.strip()) == 0: continue
                 
                 tokens = encode(text)
-                # On découpe le texte en morceaux de la taille du contexte
-                num_chunks = max(1, len(tokens) - self.block_size)
                 
-                for start_idx in range(num_chunks):
+                # OPTIMISATION : Pas (stride) = block_size
+                # On découpe le texte en blocs distincts [0:256], [256:512], etc.
+                for start_idx in range(0, len(tokens) - self.block_size + 1, self.block_size):
                     if count >= self.max_samples: break
                     self.samples.append((text, start_idx))
                     count += 1
-                    
-        except StopIteration:
-            print("⚠️ Fin du dataset atteinte ! On repart du début au prochain tour.")
-            # Optionnel : relancer l'iterator si tu veux tourner en boucle à l'infini sur un petit dataset
-            # self.iterator = iter(self.original_stream) 
+                
+                # Optionnel : Si tu veux utiliser le "reste" du texte (la fin < 256 tokens)
+                # Il faudrait gérer un padding dynamique plus complexe, 
+                # pour l'instant on ignore les fins de phrases pour la stabilité.
 
-        print(f"✅ Dataset rechargé : {len(self.samples)} nouveaux échantillons prêts.")
+        except Exception as e:
+            print(f"Erreur lors du chargement : {e}")
 
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        # Sécurité si l'index est hors limite (peut arriver lors du switch)
-        if idx >= len(self.samples):
-            idx = idx % len(self.samples)
-
-        text, start_idx = self.samples[idx]
-        tokens = encode(text)
-        
-        x = tokens[start_idx : start_idx + self.block_size]
-        y = tokens[start_idx + 1 : start_idx + self.block_size + 1]
-        
-        # Padding robuste
-        if len(x) < self.block_size: x = x + [0] * (self.block_size - len(x))
-        if len(y) < self.block_size: y = y + [0] * (self.block_size - len(y))
-            
-        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+        print(f"✅ Dataset rechargé : {len(self.samples)} échantillons uniques.")
 
 class FeedForward(nn.Module):
     def __init__(self, d_model):
