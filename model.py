@@ -33,12 +33,12 @@ config = {
     "max_lr": 6e-4,
     "min_lr": 6e-5,
     "warmup_iters": 300,
-    "max_iters": 100000,
+    "max_iters": 10000000,
     "eval_every": 200,
     "eval_iters": 50,
     "save_every": 500,
-    "checkpoint_name": "lamilaz_new.pt",
-    "wandb_id": "uo2jduuz",
+    "checkpoint_name": "modelv2",
+    "wandb_id": " ",
     "wandb_project": "nano-gpt"
 }
 
@@ -147,7 +147,7 @@ class FeedForward(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * d_model, d_model),
             nn.Dropout(config["dropout"])
         )
@@ -221,26 +221,61 @@ def evaluate_loss(model, dataloader, max_batches):
 def evaluate_semantics(model, dataset, num_samples=4, max_new=50):
     model.eval()
     refs, cands = [], []
-    indices = torch.randperm(len(dataset))[:num_samples]
     
+    # On mélange tout le dataset pour avoir du choix
+    indices = torch.randperm(len(dataset))
+    
+    found = 0
     for idx in indices:
-        x, _ = dataset[idx]
-        mid = len(x) // 2
-        ctx = x[:mid].unsqueeze(0).to(device)
-        target = x[mid:mid+max_new].tolist()
+        if found >= num_samples: break
         
+        x, _ = dataset[idx]
+        
+        # 1. On trouve la vraie longueur du texte (on ignore le padding 0)
+        # On suppose que 0 est le token de padding
+        non_pad = (x != 0).nonzero(as_tuple=True)[0]
+        
+        # Si le texte est vide ou trop court (< 10 tokens), on jette et on passe au suivant
+        if len(non_pad) < 10: 
+            continue
+            
+        real_len = non_pad[-1].item() # Le dernier index qui n'est pas 0
+        
+        # 2. On coupe intelligemment par rapport au VRAI texte, pas la taille du bloc
+        mid = real_len // 2
+        
+        # Le contexte est la première moitié
+        ctx = x[:mid].unsqueeze(0).to(device)
+        
+        # La cible est la suite (jusqu'à max_new ou la fin du vrai texte)
+        end_target = min(mid + max_new, real_len + 1)
+        target_ids = x[mid : end_target].tolist()
+        ref_text = decode(target_ids).strip()
+        
+        # 3. Double sécurité : si la référence est vide après décodage, on jette
+        if not ref_text: 
+            continue
+            
+        # Si on arrive ici, c'est un BON exemple
         gen = generate(model, ctx, max_new)[0, mid:].tolist()
         cands.append(decode(gen))
-        refs.append(decode(target))
+        refs.append(ref_text)
+        found += 1
         
+    # Si vraiment on n'a rien trouvé (très improbable), on évite le crash
+    if not cands: return 0.0, 0.0, [], []
+        
+    # Calcul des scores (maintenant sûrs)
     emb1 = semantic_model.encode(cands, convert_to_tensor=True)
     emb2 = semantic_model.encode(refs, convert_to_tensor=True)
     cosine = torch.diag(util.cos_sim(emb1, emb2)).mean().item()
     
     try:
+        # Plus de warning ici car refs ne contient que du vrai texte
         _, _, F1 = bert_score_func(cands, refs, lang="en", verbose=False, device=device)
         bert_val = F1.mean().item()
-    except:
+    except Exception as e:
+        print(f"Erreur BERT Score: {e}")
         bert_val = 0.0
         
     model.train()
@@ -271,7 +306,7 @@ if __name__ == "__main__":
         # step = checkpoint.get('step', 0) 
     print("Streaming data ...")
     # On charge le stream UNE SEULE FOIS pour ne pas repartir du début à chaque refresh
-    ds_stream = load_dataset("rojagtap/bookcorpus", split="train", streaming=True)
+    ds_stream = load_dataset("rojagtap/bookcorpus", split="train", streaming=True).shuffle(seed=42, buffer_size=20000)
     
     # On instancie nos datasets intelligents
     # Train: prend les items 3 à 19 sur chaque bloc de 20
@@ -329,7 +364,7 @@ if __name__ == "__main__":
             # --- SAUVEGARDE ---
             if step % config["save_every"] == 0:
                 print(f"💾 Sauvegarde au step {step}...")
-                fname = config["checkpoint_name"]
+                fname = f"{config["checkpoint_name"]}_{step}.pt"
                 torch.save(model.state_dict(), fname) # Sauvegarde simple des poids
                 upload_to_drive(fname)
 
