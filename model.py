@@ -253,7 +253,7 @@ if __name__ == "__main__":
     # =========================================================================
     
     # 1. WandB & Config
-    wandb.init(project=config["wandb_project"], resume="allow", config=config, id=config["wandb_id"])
+    wandb.init(project=config["wandb_project"], resume="allow", config=config)# id=config["wandb_id"]
     
     # 2. Création du Modèle & Optimiseur (Le "Cerveau")
     print("Création du modèle...")
@@ -312,6 +312,9 @@ if __name__ == "__main__":
                 v_loss = evaluate_loss(model, val_loader, config["eval_iters"])
                 # Note: evaluate_semantics peut être lent, à commenter si besoin de vitesse
                 bert, cos, cands, refs = evaluate_semantics(model, val_ds)
+                prompts = torch.tensor([encode(p) for p in ["Hello", "Love", "Help"]]).to(device)
+                outputs = generate(model, prompts, 100)
+                outputs = [[decode(output.tolist())] for output in outputs]
                 
                 print(f"Step {step}: Val Loss {v_loss:.4f} | BERT {bert:.4f} | Cos {cos:.4f}")
                 wandb.log({
@@ -319,7 +322,8 @@ if __name__ == "__main__":
                     "train_loss": t_loss, "val_loss": v_loss,
                     "bert_score": bert, "cosine_sim": cos,
                     "semantic_table": wandb.Table(columns=["Gen", "Ref"], data=list(zip(cands, refs))),
-                    "batch_number" : batch_num
+                    "batch_number" : batch_num,
+                    "samples" :  wandb.Table(columns=["samples"], data=outputs)
                 })
 
             # --- SAUVEGARDE ---
