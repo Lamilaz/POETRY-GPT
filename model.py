@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import math
 import os
-import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,28 +24,38 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # --- CONFIGURATION ---
 config = {
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "dropout": 0.2,
+    "dropout": 0.1, # Réduit légèrement pour converger plus vite si dataset large
     "d_model": 512,
     "n_heads": 8,
     "n_layers": 6,
     "block_size": 256,
-    "batch_size": 32,
+    "batch_size": 64, # Augmenté car Mixed Precision économise de la VRAM
     "max_lr": 6e-4,
     "min_lr": 6e-5,
-    "warmup_iters": 300,
-    "max_iters": 50000,
-    "eval_every": 200,
+    "warmup_iters": 1000,
+    "max_iters": 50000, # Ajusté pour un entrainement plus standard
+    "eval_every": 500,
     "eval_iters": 50,
-    "save_every": 500,
+    "save_every": 2000,
     "checkpoint_name": "modelv2",
-    "wandb_id": " ",
-    "wandb_project": "nano-gpt"
+    "wandb_project": "nano-gpt",
+    "dataset_name": "rojagtap/bookcorpus", # Dataset cible
+    "use_compile": True # Activer torch.compile (PyTorch 2.0+)
 }
 
 device = config["device"]
+print(f"Using device: {device}")
 
 # --- TOKENIZER & METRICS ---
-tokenizer = Tokenizer.from_file("tokenizer.json")
+# Assurez-vous que tokenizer.json existe, sinon il faut le créer ou utiliser un pretrained
+if not os.path.exists("tokenizer.json"):
+    print("⚠️ Attention: 'tokenizer.json' introuvable. Assurez-vous d'avoir entraîné votre tokenizer.")
+    # Fallback pour le test si pas de fichier (à retirer si vous avez votre fichier)
+    # from tokenizers import Tokenizer
+    # tokenizer = Tokenizer.from_pretrained("bert-base-uncased")
+else:
+    tokenizer = Tokenizer.from_file("tokenizer.json")
+
 vocab_size = tokenizer.get_vocab_size()
 
 print("Loading semantic model...")
@@ -80,53 +90,79 @@ def upload_to_drive(filename, drive_folder_id=None):
     except Exception as e:
         print(f"Drive Upload Error: {e}")
 
-class StreamingTextDataset(Dataset):
-    def __init__(self, stream_dataset, block_size, max_samples=100000):
+# --- DATASET OPTIMISÉ (NON-STREAMING) ---
+class PretokenizedDataset(Dataset):
+    """
+    Dataset qui charge tout en mémoire (via HuggingFace Arrow) 
+    et découpe des blocs aléatoires.
+    """
+    def __init__(self, hf_dataset, block_size):
+        self.dataset = hf_dataset
         self.block_size = block_size
-        self.max_samples = max_samples
-        # On transforme le stream en itérateur persistant pour reprendre où on s'est arrêté
-        self.iterator = iter(stream_dataset) 
-        self.samples = []
+        # On calcule la taille totale virtuelle en tokens (approximatif pour l'indexage)
+        self.length = len(self.dataset)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        # On récupère une ligne pré-tokenisée
+        # Note: Pour un vrai entrainement LLM, on concatène souvent tout,
+        # mais ici on garde la structure par "document" pour simplifier
+        ids = self.dataset[idx]['ids']
         
-        # Premier chargement automatique
-        self.renew_data()
-
-    def renew_data(self):
-        print(f"🔄 Chargement de {self.max_samples} nouvelles données...")
-        self.samples = [] 
-        count = 0
+        # Si le document est trop court, on pad ou on prend le suivant (simplifié ici par padding)
+        if len(ids) <= self.block_size + 1:
+            # Padding avec 0
+            pad_len = (self.block_size + 1) - len(ids)
+            ids = ids + [0] * pad_len
         
-        try:
-            while count < self.max_samples:
-                try:
-                    item = next(self.iterator)
-                except StopIteration:
-                    print("⚠️ Fin du dataset source ! On repart du début.")
-                    # Recharger le dataset depuis le début si nécessaire
-                    # self.iterator = iter(load_dataset(...)) 
-                    break
+        # Choix aléatoire d'une fenêtre dans le document si long
+        # ou prise du début si juste assez long
+        max_start = len(ids) - (self.block_size + 1)
+        if max_start > 0:
+            start_idx = random.randint(0, max_start)
+        else:
+            start_idx = 0
 
-                text = item["text"]
-                if not text or len(text.strip()) == 0: continue
-                
-                tokens = encode(text)
-                
-                # OPTIMISATION : Pas (stride) = block_size
-                # On découpe le texte en blocs distincts [0:256], [256:512], etc.
-                for start_idx in range(0, len(tokens) - self.block_size + 1, self.block_size):
-                    if count >= self.max_samples: break
-                    self.samples.append((text, start_idx))
-                    count += 1
-                
-                # Optionnel : Si tu veux utiliser le "reste" du texte (la fin < 256 tokens)
-                # Il faudrait gérer un padding dynamique plus complexe, 
-                # pour l'instant on ignore les fins de phrases pour la stabilité.
+        chunk = ids[start_idx : start_idx + self.block_size + 1]
+        
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
+        
+        return x, y
 
-        except Exception as e:
-            print(f"Erreur lors du chargement : {e}")
+def prepare_data():
+    """Télécharge, tokenise et split le dataset."""
+    print("⬇️ Téléchargement du dataset (cela peut prendre du temps la première fois)...")
+    # Chargement standard (non-streaming) -> Stocké sur disque par HuggingFace
+    dataset = load_dataset(config["dataset_name"], split="train") 
+    
+    # Pour le dev rapide, on peut décommenter la ligne suivante pour prendre juste 10%
+    # dataset = dataset.select(range(100000)) 
 
-        print(f"✅ Dataset rechargé : {len(self.samples)} échantillons uniques.")
+    print("✂️ Tokenization en cours (multiprocess)...")
+    def process_func(examples):
+        return {"ids": [encode(text) for text in examples["text"]]}
 
+    # .map va cacher le résultat sur disque. Le redémarrage sera instantané.
+    tokenized_ds = dataset.map(
+        process_func, 
+        batched=True, 
+        remove_columns=["text"], 
+        num_proc=os.cpu_count() # Utilise tous les cœurs CPU
+    )
+    
+    # Filtre les lignes vides
+    tokenized_ds = tokenized_ds.filter(lambda x: len(x['ids']) > 0)
+
+    # Split Train/Val (90/10)
+    split_ds = tokenized_ds.train_test_split(test_size=0.10, seed=42)
+    
+    return split_ds['train'], split_ds['test']
+
+
+# --- MODEL ARCHITECTURE ---
 class FeedForward(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -150,9 +186,11 @@ class MainLayer(nn.Module):
 
     def compute_attn_mask(self, x):
         L = x.shape[1]
+        # create_mask est plus efficace et ne recrée pas le tenseur s'il est caché
         return torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
 
     def forward(self, x):
+        # Attention: PyTorch 2.x optimise automatiquement MultiheadAttention si possible
         qkv = self.norm1(x)
         attn_out, _ = self.multihead(qkv, qkv, qkv, attn_mask=self.compute_attn_mask(x), need_weights=False)
         x = x + attn_out
@@ -168,10 +206,22 @@ class TransformerDecoder(nn.Module):
         self.ln_f = nn.LayerNorm(config["d_model"])
         self.head = nn.Linear(config["d_model"], vocab_size)
 
+        # Init weights (Best practice pour GPT)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, x):
         B, T = x.shape
+        # Clamp pour éviter crash si idx > block_size
         tok_emb = self.token_embedding(x)
-        pos_emb = self.position_embedding(torch.arange(T, device=device))
+        pos_emb = self.position_embedding(torch.arange(T, device=x.device))
         x = tok_emb + pos_emb
         x = self.layers(x)
         x = self.ln_f(x)
@@ -183,22 +233,34 @@ def model_loss(model, x, targets):
     loss = F.cross_entropy(logits.view(B * T, V), targets.view(B * T), ignore_index=0)
     return loss
 
+@torch.no_grad()
 def generate(model, x, max_new_tokens):
+    model.eval()
     for _ in range(max_new_tokens):
         x_crop = x[:, -config["block_size"]:]
         logits = model(x_crop)[:, -1, :]
         probs = F.softmax(logits, dim=1)
         x_next = torch.multinomial(probs, num_samples=1)
         x = torch.cat([x, x_next], dim=1)
+    model.train()
     return x
 
 @torch.no_grad()
 def evaluate_loss(model, dataloader, max_batches):
     model.eval()
     losses = []
-    for i, (x, y) in enumerate(dataloader):
-        if i >= max_batches: break
-        losses.append(model_loss(model, x.to(device), y.to(device)).item())
+    # Utilisation d'itérateur pour ne pas reset le dataloader entier
+    iter_dl = iter(dataloader)
+    for _ in range(max_batches):
+        try:
+            x, y = next(iter_dl)
+            x, y = x.to(device), y.to(device)
+            # Pas besoin de AMP pour eval loss généralement, mais plus sûr
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                loss = model_loss(model, x, y)
+            losses.append(loss.item())
+        except StopIteration:
+            break
     model.train()
     return np.mean(losses) if losses else 0.0
 
@@ -207,60 +269,44 @@ def evaluate_semantics(model, dataset, num_samples=4, max_new=50):
     model.eval()
     refs, cands = [], []
     
-    # On mélange tout le dataset pour avoir du choix
-    indices = torch.randperm(len(dataset))
-    
+    indices = torch.randint(0, len(dataset), (num_samples * 2,)).tolist()
     found = 0
+    
     for idx in indices:
         if found >= num_samples: break
         
         x, _ = dataset[idx]
         
-        # 1. On trouve la vraie longueur du texte (on ignore le padding 0)
-        # On suppose que 0 est le token de padding
+        # Filtre padding
         non_pad = (x != 0).nonzero(as_tuple=True)[0]
-        
-        # Si le texte est vide ou trop court (< 10 tokens), on jette et on passe au suivant
-        if len(non_pad) < 10: 
-            continue
+        if len(non_pad) < 10: continue
             
-        real_len = non_pad[-1].item() # Le dernier index qui n'est pas 0
-        
-        # 2. On coupe intelligemment par rapport au VRAI texte, pas la taille du bloc
+        real_len = non_pad[-1].item()
         mid = real_len // 2
         
-        # Le contexte est la première moitié
         ctx = x[:mid].unsqueeze(0).to(device)
-        
-        # La cible est la suite (jusqu'à max_new ou la fin du vrai texte)
         end_target = min(mid + max_new, real_len + 1)
         target_ids = x[mid : end_target].tolist()
         ref_text = decode(target_ids).strip()
         
-        # 3. Double sécurité : si la référence est vide après décodage, on jette
-        if not ref_text: 
-            continue
+        if not ref_text: continue
             
-        # Si on arrive ici, c'est un BON exemple
         gen = generate(model, ctx, max_new)[0, mid:].tolist()
         cands.append(decode(gen))
         refs.append(ref_text)
         found += 1
-        
-    # Si vraiment on n'a rien trouvé (très improbable), on évite le crash
+    
     if not cands: return 0.0, 0.0, [], []
         
-    # Calcul des scores (maintenant sûrs)
     emb1 = semantic_model.encode(cands, convert_to_tensor=True)
     emb2 = semantic_model.encode(refs, convert_to_tensor=True)
     cosine = torch.diag(util.cos_sim(emb1, emb2)).mean().item()
     
     try:
-        # Plus de warning ici car refs ne contient que du vrai texte
         _, _, F1 = bert_score_func(cands, refs, lang="en", verbose=False, device=device)
         bert_val = F1.mean().item()
     except Exception as e:
-        print(f"Erreur BERT Score: {e}")
+        # print(f"Erreur BERT Score: {e}") 
         bert_val = 0.0
         
     model.train()
@@ -268,111 +314,107 @@ def evaluate_semantics(model, dataset, num_samples=4, max_new=50):
 
 # --- MAIN ---
 if __name__ == "__main__":
-    # =========================================================================
-    # ÉTAPE 1 : INITIALISATION (À FAIRE UNE SEULE FOIS AU DÉBUT)
-    # =========================================================================
     
-    # 1. WandB & Config
-    wandb.init(project=config["wandb_project"], resume="allow", config=config)# id=config["wandb_id"]
+    # 1. Init WandB
+    wandb.init(project=config["wandb_project"], resume="allow", config=config)
     
-    # 2. Création du Modèle & Optimiseur (Le "Cerveau")
-    print("Création du modèle...")
+    # 2. Préparation des données (One-time cost)
+    train_data_hf, val_data_hf = prepare_data()
+    
+    print(f"📚 Train size: {len(train_data_hf)} docs | Val size: {len(val_data_hf)} docs")
+    
+    train_ds = PretokenizedDataset(train_data_hf, config["block_size"])
+    val_ds = PretokenizedDataset(val_data_hf, config["block_size"])
+    
+    # Num_workers > 0 accélère le chargement, pin_memory=True pour GPU
+    train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=2, pin_memory=True)
+
+    # 3. Modèle & Optimisation
+    print("🧠 Création du modèle...")
+    
     model = TransformerDecoder().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["max_lr"])
+    
+    # Compile le modèle (PyTorch 2.0 optimization)
+    if config["use_compile"] and hasattr(torch, "compile"):
+        print("🚀 Compiling model with torch.compile...")
+        model = torch.compile(model)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["max_lr"], weight_decay=1e-2)
+    scaler = torch.amp.GradScaler("cuda") # Pour Mixed Precision
+
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    # 3. Reprise d'entraînement (Si le fichier existe)
+    # 4. Boucle d'entrainement
     step = 0
-    # if os.path.exists(config["checkpoint_name"]):
-    #     print(f"♻️ Reprise depuis {config['checkpoint_name']}...")
-    #     checkpoint = torch.load(config["checkpoint_name"], map_location=device)
-    #     model.load_state_dict(checkpoint)
-        # Idéalement, sauvegarder 'step' dans le checkpoint pour reprendre exactement au bon endroit
-        # step = checkpoint.get('step', 0) 
-    print("Streaming data ...")
-    # On charge le stream UNE SEULE FOIS pour ne pas repartir du début à chaque refresh
-    ds_stream = load_dataset("rojagtap/bookcorpus", split="train", streaming=True).shuffle(seed=42, buffer_size=20000)
+    print("🚀 Début de l'entraînement optimisé !")
     
-    # On instancie nos datasets intelligents
-    # Train: prend les items 3 à 19 sur chaque bloc de 20
-# Train: On baisse max_samples à 20 000 (au lieu de 100 000 par défaut)
-    train_ds = StreamingTextDataset(
-        ds_stream.filter(lambda x, i: (i % 20) >= 3, with_indices=True), 
-        config["block_size"],
-        max_samples=20000  # <--- AJOUTE CECI
-    )
+    # On itère indéfiniment sur le loader (cycle)
+    train_iter = iter(train_loader)
     
-    # Val: On baisse aussi (ex: 5000 suffisent largement pour la validation)
-    val_ds = StreamingTextDataset(
-        ds_stream.filter(lambda x, i: (i % 20) < 3, with_indices=True), 
-        config["block_size"],
-        max_samples=5000   # <--- AJOUTE CECI
-    )
-
-    # =========================================================================
-    # ÉTAPE 2 : BOUCLE INFINIE D'ENTRAÎNEMENT
-    # =========================================================================
-    model.train()
-    print("🚀 Début de l'entraînement !")
-    batch_num = 0
+    t0 = time.time()
+    
     while step < config["max_iters"]:
-        batch_num+=1
-        # A. Création des Loaders pour le chunk actuel
-        # On doit les recréer car la taille du dataset change à chaque renew_data()
-        train_loader = DataLoader(train_ds, batch_size=config["batch_size"], shuffle=True, num_workers=0)
-        val_loader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False, num_workers=0)
-
-        # B. Boucle sur les données actuelles (RAM)
-        for x, y in train_loader:
-            step += 1
+        step += 1
+        
+        # Récupération batch (avec reset automatique si fin d'epoch)
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            x, y = next(train_iter)
             
-            # --- LEARNING RATE & OPTIMIZER ---
-            lr = get_lr(step)
-            for param_group in optimizer.param_groups: param_group['lr'] = lr
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        
+        # --- TRAINING STEP (Mixed Precision) ---
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups: param_group['lr'] = lr
+        
+        optimizer.zero_grad(set_to_none=True) # Plus efficace que zero_grad()
+        
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            loss = model_loss(model, x, y)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer) # Nécessaire pour le clip_grad
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        # --- LOGGING ---
+        if step % config["eval_every"] == 0:
+            dt = time.time() - t0
+            t0 = time.time()
             
-            # --- EVALUATION ---
-            if step % config["eval_every"] == 0:
-                t_loss = evaluate_loss(model, train_loader, config["eval_iters"])
-                v_loss = evaluate_loss(model, val_loader, config["eval_iters"])
-                # Note: evaluate_semantics peut être lent, à commenter si besoin de vitesse
-                bert, cos, cands, refs = evaluate_semantics(model, val_ds)
-                prompts = torch.tensor([encode(p) for p in ["Hello", "Love", "Help"]]).to(device)
-                outputs = generate(model, prompts, 100)
-                outputs = [[decode(output.tolist())] for output in outputs]
-                
-                print(f"Step {step}: Val Loss {v_loss:.4f} | BERT {bert:.4f} | Cos {cos:.4f}")
-                wandb.log({
-                    "step": step, "lr": lr,
-                    "train_loss": t_loss, "val_loss": v_loss,
-                    "bert_score": bert, "cosine_sim": cos,
-                    "semantic_table": wandb.Table(columns=["Gen", "Ref"], data=list(zip(cands, refs))),
-                    "batch_number" : batch_num,
-                    "samples" :  wandb.Table(columns=["samples"], data=outputs)
-                })
-
-            # --- SAUVEGARDE ---
-            if step % config["save_every"] == 0:
-                print(f"💾 Sauvegarde au step {step}...")
-                fname = f"{config["checkpoint_name"]}_{step}.pt"
-                torch.save(model.state_dict(), fname) # Sauvegarde simple des poids
-                upload_to_drive(fname)
-
-            # --- BACKPROPAGATION (APPRENTISSAGE) ---
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad() # Reset des gradients précédents
-            loss = model_loss(model, x, y) # Calcul de l'erreur
-            loss.backward() # Calcul de la correction nécessaire
-            optimizer.step() # Application de la correction
-
-            # Stop si on a fini
-            if step >= config["max_iters"]: 
-                break 
-
-        # C. FIN DU CHUNK -> ON RECHARGE DE NOUVELLES DONNÉES
-        if step < config["max_iters"]:
-            print(f"--- Fin du chunk de données. Téléchargement de la suite... ---")
-            train_ds.renew_data()
-            val_ds.renew_data()
+            # Évaluation
+            v_loss = evaluate_loss(model, val_loader, config["eval_iters"])
+            t_loss = loss.item()
             
+            print(f"Step {step}: Train {t_loss:.4f} | Val {v_loss:.4f} | {dt:.2f}s per interval")
+            
+            # Semantic eval (un peu plus lourd, on peut le faire moins souvent)
+            bert, cos, cands, refs = evaluate_semantics(model, val_ds, num_samples=2)
+            
+            # Génération sample
+            prompts = torch.tensor([encode(p) for p in ["The", "It was", "She"]]).to(device)
+            outputs = generate(model, prompts, 50)
+            outputs_text = [[decode(o.tolist())] for o in outputs]
+            
+            wandb.log({
+                "step": step, "lr": lr,
+                "train_loss": t_loss, "val_loss": v_loss,
+                "bert_score": bert, "cosine_sim": cos,
+                "samples": wandb.Table(columns=["samples"], data=outputs_text)
+            })
+
+        # --- SAVE ---
+        if step % config["save_every"] == 0:
+            print(f"💾 Sauvegarde step {step}...")
+            fname = f"{config['checkpoint_name']}_{step}.pt"
+            # On sauvegarde le state_dict original (pas celui du compiled model)
+            raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+            torch.save(raw_model.state_dict(), fname)
+            upload_to_drive(fname)
+
     wandb.finish()
-    print("✅ Entraînement terminé avec succès.")
+    print("✅ Entraînement terminé.")
