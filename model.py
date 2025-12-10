@@ -16,6 +16,7 @@ from googleapiclient.http import MediaFileUpload
 from bert_score import score as bert_score_func
 from sentence_transformers import SentenceTransformer, util
 import logging
+import random
 
 # Configuration silencieuse
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -34,9 +35,9 @@ config = {
     "min_lr": 6e-5,
     "warmup_iters": 1000,
     "max_iters": 50000, # Ajusté pour un entrainement plus standard
-    "eval_every": 500,
-    "eval_iters": 50,
-    "save_every": 2000,
+    "eval_every": 50,
+    "eval_iters": 200,
+    "save_every": 500,
     "checkpoint_name": "modelv2",
     "wandb_project": "nano-gpt",
     "dataset_name": "rojagtap/bookcorpus", # Dataset cible
@@ -235,14 +236,13 @@ def model_loss(model, x, targets):
 
 @torch.no_grad()
 def generate(model, x, max_new_tokens):
-    model.eval()
     for _ in range(max_new_tokens):
         x_crop = x[:, -config["block_size"]:]
-        logits = model(x_crop)[:, -1, :]
+        logits = model(x_crop)
+        logits = logits[:, -1, :]
         probs = F.softmax(logits, dim=1)
         x_next = torch.multinomial(probs, num_samples=1)
         x = torch.cat([x, x_next], dim=1)
-    model.train()
     return x
 
 @torch.no_grad()
@@ -316,7 +316,7 @@ def evaluate_semantics(model, dataset, num_samples=4, max_new=50):
 if __name__ == "__main__":
     
     # 1. Init WandB
-    wandb.init(project=config["wandb_project"], resume="allow", config=config)
+    wandb.init(project=config["wandb_project"], resume="allow", config=config, id="7gfg4rby" )
     
     # 2. Préparation des données (One-time cost)
     train_data_hf, val_data_hf = prepare_data()
@@ -334,7 +334,7 @@ if __name__ == "__main__":
     print("🧠 Création du modèle...")
     
     model = TransformerDecoder().to(device)
-    
+    model = torch.load("modelv2_1500.pt", weights_only=True)
     # Compile le modèle (PyTorch 2.0 optimization)
     if config["use_compile"] and hasattr(torch, "compile"):
         print("🚀 Compiling model with torch.compile...")
@@ -346,7 +346,7 @@ if __name__ == "__main__":
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
     # 4. Boucle d'entrainement
-    step = 0
+    step = 1500
     print("🚀 Début de l'entraînement optimisé !")
     
     # On itère indéfiniment sur le loader (cycle)
@@ -390,21 +390,20 @@ if __name__ == "__main__":
             v_loss = evaluate_loss(model, val_loader, config["eval_iters"])
             t_loss = loss.item()
             
-            print(f"Step {step}: Train {t_loss:.4f} | Val {v_loss:.4f} | {dt:.2f}s per interval")
-            
             # Semantic eval (un peu plus lourd, on peut le faire moins souvent)
             bert, cos, cands, refs = evaluate_semantics(model, val_ds, num_samples=2)
             
             # Génération sample
-            prompts = torch.tensor([encode(p) for p in ["The", "It was", "She"]]).to(device)
-            outputs = generate(model, prompts, 50)
-            outputs_text = [[decode(o.tolist())] for o in outputs]
+            prompts = torch.tensor([encode(p) for p in ["Hello", "Love", "Help"]]).to(device)
+            outputs = generate(model, prompts, 100)
+            outputs = [[decode(output.tolist())] for output in outputs]
+            print(f"step {step}: train loss {t_loss:.4f}, val loss {v_loss:.4f}")
             
             wandb.log({
                 "step": step, "lr": lr,
                 "train_loss": t_loss, "val_loss": v_loss,
                 "bert_score": bert, "cosine_sim": cos,
-                "samples": wandb.Table(columns=["samples"], data=outputs_text)
+                "samples": wandb.Table(columns=["samples"], data=outputs)
             })
 
         # --- SAVE ---
